@@ -2,3 +2,4 @@ crazyfflie-demos*
 cache
 .venv
 .vscode
+test_log*
