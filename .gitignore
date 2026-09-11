@@ -1,5 +1,5 @@
-crazyfflie-demos*
+crazyflie-demos/*
 cache
 .venv
 .vscode
-test_log*
+test_log.py
