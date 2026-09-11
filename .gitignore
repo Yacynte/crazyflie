@@ -1,4 +1,4 @@
-crazyflie-demos/*
+crazyflie-demos/
 cache
 .venv
 .vscode
