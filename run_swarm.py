@@ -6,6 +6,7 @@ Fly a consensus pattern with N drones, in simulation or on hardware.
     python run_swarm.py --sim --pattern circle --n 3 --scenario leave_join
     python run_swarm.py --pattern hover --duration 8          # hardware, 2 drones
     python run_swarm.py --crazysim --pattern hover            # CrazySim / Gazebo, 2 drones
+    python run_swarm.py --crazysim --frame world --pattern circle   # force the frame
 
 Hardware: drones must sit at their ORIGINS below, all facing the same way.
 Place them under their slot at t = 0 (for 2 drones every pattern starts with
@@ -39,9 +40,9 @@ def build(args):
             swarm.add_drone(SimDrone(i, start=(d[0], d[1], 0.0)), link=None)
         elif args.crazysim:
             x, y = CRAZYSIM_SPAWN[k]
-            origin = (0.0, 0.0, 0.0) if args.world_frame else (x, y, 0.0)
-            swarm.add_drone(Drone(f"udp://0.0.0.0:{19850 + k}", i, origin=origin,
-                                  require_flow_deck=False), link=None)
+            drone = Drone(f"udp://0.0.0.0:{19850 + k}", i, require_flow_deck=False)
+            drone.expected_start = (x, y)
+            swarm.add_drone(drone, link=None)
         else:
             uri, origin = HARDWARE[i]
             swarm.add_drone(Drone(uri, i, origin=origin), link=None)
@@ -59,6 +60,23 @@ def build(args):
         for a, b in zip(ids[1:], ids[2:]):
             swarm.topology.add_link(a, b, **kw)
     return swarm
+
+
+def set_crazysim_origins(swarm, frame):
+    """Pick each drone's origin so that position() is in the shared (world) frame.
+    auto: if the raw estimate is closer to the spawn point than to (0, 0),
+    the estimate is already in world coordinates and the origin must be zero."""
+    for m in swarm.members.values():
+        d = m.drone
+        spawn = np.array([*d.expected_start, 0.0])
+        raw = d.local_position()
+        if frame == "auto":
+            is_world = np.linalg.norm(raw[:2] - spawn[:2]) < np.linalg.norm(raw[:2])
+        else:
+            is_world = frame == "world"
+        d.origin = np.zeros(3) if is_world else spawn
+        print(f"{d.name}: raw estimate {np.round(raw, 2)} -> "
+              f"{'world' if is_world else 'local'} frame, origin {np.round(d.origin, 2)}")
 
 
 def scenario_events(name, swarm):
@@ -104,8 +122,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--sim", action="store_true", help="pure Python simulation (SimDrone)")
     ap.add_argument("--crazysim", action="store_true", help="CrazySim SITL drones over UDP")
-    ap.add_argument("--world-frame", action="store_true",
-                    help="CrazySim estimate is already in the world frame (origin = 0)")
+    ap.add_argument("--frame", choices=["auto", "local", "world"], default="auto",
+                    help="CrazySim: is the onboard estimate relative to the spawn point "
+                         "(local) or already in the Gazebo world frame (world)?")
     ap.add_argument("--pattern", default="hover")
     ap.add_argument("--duration", type=float, default=20.0)
     ap.add_argument("--n", type=int, default=2)
@@ -127,6 +146,10 @@ if __name__ == "__main__":
 
     # with --sim, give drones deliberately different centre copies to show agreement
     swarm.connect_all()
+    if args.crazysim:
+        set_crazysim_origins(swarm, args.frame)
+    if not args.sim:
+        swarm.preflight_check()
     try:
         swarm.takeoff_all()
         if args.sim:

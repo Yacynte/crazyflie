@@ -3,3 +3,5 @@ cache
 .venv
 .vscode
 test_log.py
+__pycache__/
+*.png
