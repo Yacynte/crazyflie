@@ -5,6 +5,7 @@ Fly a consensus pattern with N drones, in simulation or on hardware.
     python run_swarm.py --sim --pattern eight --n 3 --topology chain --loss 0.1
     python run_swarm.py --sim --pattern circle --n 3 --scenario leave_join
     python run_swarm.py --pattern hover --duration 8          # hardware, 2 drones
+    python run_swarm.py --crazysim --pattern hover            # CrazySim / Gazebo, 2 drones
 
 Hardware: drones must sit at their ORIGINS below, all facing the same way.
 Place them under their slot at t = 0 (for 2 drones every pattern starts with
@@ -24,14 +25,23 @@ HARDWARE = {
     1: ("radio://0/80/2M/E7E7E7E702", (0.0, 0.3, 0.0)),
 }
 
+# CrazySim: drone k listens on UDP port 19850 + k. Spawn positions must match
+# the lines of CrazySim's agents file (x,y per line), in the same order.
+CRAZYSIM_SPAWN = [(0.0, -0.3), (0.0, 0.3), (0.0, 0.9)]
+
 
 def build(args):
     swarm = ConsensusSwarm(sim=args.sim, height=args.height)
-    ids = list(range(args.n)) if args.sim else sorted(HARDWARE)[: args.n]
+    ids = sorted(HARDWARE)[: args.n] if not (args.sim or args.crazysim) else list(range(args.n))
     for k, i in enumerate(ids):
         if args.sim:   # start each drone under its slot at t = 0
             _, d, _ = get_pattern(args.pattern)(0.0, k, len(ids))
             swarm.add_drone(SimDrone(i, start=(d[0], d[1], 0.0)), link=None)
+        elif args.crazysim:
+            x, y = CRAZYSIM_SPAWN[k]
+            origin = (0.0, 0.0, 0.0) if args.world_frame else (x, y, 0.0)
+            swarm.add_drone(Drone(f"udp://0.0.0.0:{19850 + k}", i, origin=origin,
+                                  require_flow_deck=False), link=None)
         else:
             uri, origin = HARDWARE[i]
             swarm.add_drone(Drone(uri, i, origin=origin), link=None)
@@ -92,7 +102,10 @@ def plot(swarm, path):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sim", action="store_true")
+    ap.add_argument("--sim", action="store_true", help="pure Python simulation (SimDrone)")
+    ap.add_argument("--crazysim", action="store_true", help="CrazySim SITL drones over UDP")
+    ap.add_argument("--world-frame", action="store_true",
+                    help="CrazySim estimate is already in the world frame (origin = 0)")
     ap.add_argument("--pattern", default="hover")
     ap.add_argument("--duration", type=float, default=20.0)
     ap.add_argument("--n", type=int, default=2)
