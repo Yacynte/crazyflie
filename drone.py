@@ -222,6 +222,7 @@ class BaseDrone:
         self.origin = np.array(origin, float)     # position of local (0,0,0) in the shared frame
         self.connected = False
         self.blind = False                         # True: own position not available
+        self.expected_start = None                 # (x, y) where it should sit before takeoff
 
     # shared-frame state
     def position(self) -> np.ndarray: raise NotImplementedError
@@ -314,6 +315,11 @@ class Drone(BaseDrone):
             self._v = np.array([data["stateEstimate.vx"], data["stateEstimate.vy"],
                                 data["stateEstimate.vz"]])
             self.last_state_time = time.time()
+
+    def local_position(self):
+        """Raw onboard estimate, before adding the origin."""
+        with self._lock:
+            return self._p_local.copy()
 
     def position(self):
         with self._lock:
@@ -622,6 +628,32 @@ class ConsensusSwarm:
             th.join()
         if errors:
             raise RuntimeError(f"connection failed: {errors}")
+
+    def preflight_check(self, tol=0.15):
+        """Before takeoff: positions must match where the drones really sit, and
+        no two drones may be closer than min_separation. Catches frame errors
+        (e.g. an origin counted twice), which no in-flight check can detect."""
+        P = {}
+        for i, m in sorted(self.members.items()):
+            p = m.drone.position()
+            P[i] = p
+            msg = f"  {m.drone.name}: shared-frame p = {np.round(p, 2)}"
+            exp = m.drone.expected_start
+            if exp is not None:
+                err = np.linalg.norm(p[:2] - np.asarray(exp, float))
+                msg += f"  expected {tuple(exp)}  error {err:.2f} m"
+                if err > tol:
+                    print(msg)
+                    raise RuntimeError(f"{m.drone.name}: estimate is {err:.2f} m from its "
+                                       f"expected start. Check origin / frame settings.")
+            print(msg)
+        ids = sorted(P)
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                d = np.linalg.norm(P[ids[a]] - P[ids[b]])
+                if d < self.min_separation:
+                    raise RuntimeError(f"drones {ids[a]} and {ids[b]} are {d:.2f} m apart on the ground")
+        print("preflight OK")
 
     def takeoff_all(self, height=None, duration=2.5):
         """Everyone climbs together (commands go out back-to-back from one thread)."""
