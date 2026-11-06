@@ -5,3 +5,5 @@ cache
 test_log.py
 __pycache__/
 *.png
+*.npz
+noise/

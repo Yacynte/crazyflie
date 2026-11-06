@@ -245,7 +245,6 @@ class Drone(BaseDrone):
     """A real Crazyflie through cflib. The link stays open until disconnect()."""
 
     LOG_PERIOD_MS = 20        # 50 Hz state logging
-    FLYING_HYSTERESIS_S = 2.5 # firmware IS_FLYING_HYSTERESIS_THRESHOLD (2 s) + margin
 
     def __init__(self, uri, drone_id, name=None, origin=(0.0, 0.0, 0.0),
                  require_flow_deck=True, cache="./cache"):
@@ -259,7 +258,6 @@ class Drone(BaseDrone):
         self._p_local = np.zeros(3)
         self._v = np.zeros(3)
         self.last_state_time = None
-        self._landed_at = 0.0
 
     @property
     def cf(self):
@@ -347,7 +345,6 @@ class Drone(BaseDrone):
         """Hand control back to the high-level commander, then land (non-blocking)."""
         self.cf.commander.send_notify_setpoint_stop()
         self.cf.high_level_commander.land(0.0, duration)
-        self._landed_at = time.time() + duration
 
     def stop(self):
         """Emergency: motors off immediately."""
@@ -362,13 +359,10 @@ class Drone(BaseDrone):
         try:
             if self._log is not None:
                 self._log.stop()
-            # The supervisor still counts as "flying" for 2 s after the motors
-            # idle; a disarm inside that window sends it to free fall -> Locked
-            # (needs a reboot / sim restart before it will fly again).
-            wait = self._landed_at + self.FLYING_HYSTERESIS_S - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            self.cf.supervisor.send_arming_request(False)
+            # No explicit disarm: the supervisor disarms by itself 2 s (flying
+            # hysteresis) + 3 s (landing timeout) after the motors idle. A disarm
+            # while it still counts as "flying" sends it to free fall -> Locked,
+            # which only a reboot / sim restart clears.
         except Exception:
             pass
         self.scf.close_link()

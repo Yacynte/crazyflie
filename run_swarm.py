@@ -6,6 +6,7 @@ Fly a consensus pattern with N drones, in simulation or on hardware.
     python run_swarm.py --sim --pattern circle --n 3 --scenario leave_join
     python run_swarm.py --pattern hover --duration 8          # hardware, 2 drones
     python run_swarm.py --crazysim --pattern hover            # CrazySim / Gazebo, 2 drones
+    python run_swarm.py --crazysim --frame world --pattern circle   # force the frame
 
 Hardware: drones must sit at their ORIGINS below, all facing the same way.
 Place them under their slot at t = 0 (for 2 drones every pattern starts with
@@ -39,9 +40,9 @@ def build(args):
             swarm.add_drone(SimDrone(i, start=(d[0], d[1], 0.0)), link=None)
         elif args.crazysim:
             x, y = CRAZYSIM_SPAWN[k]
-            origin = (0.0, 0.0, 0.0) if args.world_frame else (x, y, 0.0)
-            swarm.add_drone(Drone(f"udp://0.0.0.0:{19850 + k}", i, origin=origin,
-                                  require_flow_deck=False), link=None)
+            drone = Drone(f"udp://0.0.0.0:{19850 + k}", i, require_flow_deck=False)
+            drone.expected_start = (x, y)
+            swarm.add_drone(drone, link=None)
         else:
             uri, origin = HARDWARE[i]
             swarm.add_drone(Drone(uri, i, origin=origin), link=None)
@@ -59,6 +60,39 @@ def build(args):
         for a, b in zip(ids[1:], ids[2:]):
             swarm.topology.add_link(a, b, **kw)
     return swarm
+
+
+def set_crazysim_origins(swarm, frame):
+    """Pick each drone's origin so that position() is in the shared (world) frame.
+    auto: if the raw estimate is closer to the spawn point than to (0, 0),
+    the estimate is already in world coordinates and the origin must be zero."""
+    for m in swarm.members.values():
+        d = m.drone
+        spawn = np.array([*d.expected_start, 0.0])
+        raw = d.local_position()
+        if frame == "auto":
+            is_world = np.linalg.norm(raw[:2] - spawn[:2]) < np.linalg.norm(raw[:2])
+        else:
+            is_world = frame == "world"
+        d.origin = np.zeros(3) if is_world else spawn
+        print(f"{d.name}: raw estimate {np.round(raw, 2)} -> "
+              f"{'world' if is_world else 'local'} frame, origin {np.round(d.origin, 2)}")
+
+
+def gazebo_rtf(samples=5, timeout=10.0):
+    """Mean real-time factor from Gazebo's /stats topic, or None if unavailable.
+    The SITL firmware runs on the wall clock while physics runs on sim time, so
+    at RTF << 1 its velocity estimate is scaled wrong: hover still works, but any
+    manoeuvre overshoots or flips."""
+    import re
+    import subprocess
+    try:
+        out = subprocess.run(["gz", "topic", "-e", "-t", "/stats", "-n", str(samples)],
+                             capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    rtf = [float(x) for x in re.findall(r"real_time_factor:\s*([0-9.eE+-]+)", out)]
+    return float(np.mean(rtf)) if rtf else None
 
 
 def scenario_events(name, swarm):
@@ -104,8 +138,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--sim", action="store_true", help="pure Python simulation (SimDrone)")
     ap.add_argument("--crazysim", action="store_true", help="CrazySim SITL drones over UDP")
-    ap.add_argument("--world-frame", action="store_true",
-                    help="CrazySim estimate is already in the world frame (origin = 0)")
+    ap.add_argument("--frame", choices=["auto", "local", "world"], default="world",
+                    help="CrazySim: is the onboard estimate relative to the spawn point "
+                         "(local) or already in the Gazebo world frame (world)? CrazySim reports world; auto only works if drones sit at their spawn.")
     ap.add_argument("--pattern", default="hover")
     ap.add_argument("--duration", type=float, default=20.0)
     ap.add_argument("--n", type=int, default=2)
@@ -115,7 +150,20 @@ if __name__ == "__main__":
     ap.add_argument("--loss", type=float, default=0.0)
     ap.add_argument("--scenario", choices=["none", "leave_join", "blind"], default="none")
     ap.add_argument("--plot", default=None, help="save a PNG of the run")
+    ap.add_argument("--min-rtf", type=float, default=0.8,
+                    help="CrazySim: refuse to fly if Gazebo's real-time factor is below this")
     args = ap.parse_args()
+
+    if args.crazysim:
+        rtf = gazebo_rtf()
+        if rtf is None:
+            print("WARNING: could not read Gazebo real-time factor (gz topic /stats)")
+        else:
+            print(f"Gazebo real-time factor = {rtf:.2f}")
+            if rtf < args.min_rtf:
+                raise SystemExit(f"real-time factor {rtf:.2f} < {args.min_rtf}: the firmware "
+                                 f"runs on the wall clock, so flight will be unstable. Close the "
+                                 f"Gazebo GUI / other load, or lower --min-rtf to fly anyway.")
 
     if not args.sim:
         import cflib.crtp
@@ -127,6 +175,10 @@ if __name__ == "__main__":
 
     # with --sim, give drones deliberately different centre copies to show agreement
     swarm.connect_all()
+    if args.crazysim:
+        set_crazysim_origins(swarm, args.frame)
+    if not args.sim:
+        swarm.preflight_check()
     try:
         swarm.takeoff_all()
         if args.sim:

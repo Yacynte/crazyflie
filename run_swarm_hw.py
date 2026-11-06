@@ -19,15 +19,15 @@ from drone import ConsensusSwarm, Drone, SimDrone
 from patterns import get_pattern
 
 # id -> (uri, origin in the shared frame). Edit to match your setup.
-# HARDWARE = {
-#     0: ("radio://0/80/2M/E7E7E7E701", (0.0, -0.3, 0.0)),
-#     1: ("radio://0/80/2M/E7E7E7E702", (0.0, 0.3, 0.0)),
-# }
-
 HARDWARE = {
-    0: ("udp://0.0.0.0:19850", (0.0, 0.0, 0.0)),
-    1: ("udp://0.0.0.0:19851", (0.0, 0.0, 0.0)),
+    0: ("radio://0/80/2M/E7E7E7E701", (0.0, -0.3, 0.0)),
+    1: ("radio://0/80/2M/E7E7E7E702", (0.0, 0.3, 0.0)),
 }
+
+# HARDWARE = {
+#     0: ("udp://0.0.0.0:19850", (0.0, 0.0, 0.0)),
+#     1: ("udp://0.0.0.0:19851", (0.0, 0.0, 0.0)),
+# }
 
 def build(args):
     swarm = ConsensusSwarm(sim=args.sim, height=args.height)
