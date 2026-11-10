@@ -54,10 +54,16 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, fields, replace
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.utils import uri_helper
 
 import numpy as np
 
@@ -318,6 +324,21 @@ class InertialKF:
 #   both    this KF with the onboard estimate fused continuously (100 Hz IMU
 #           prediction, 50 Hz visual corrections)
 SOURCES = ('imu', 'visual', 'both')
+
+# Who is commanding the motors, and on which estimate, recorded on every IMU
+# sample (`controller`):
+#   none         motors off / stopped
+#   visual       the firmware's high-level commander, on the onboard (Flow deck) estimate
+#   host         this file's controller / sink / landing, on this KF
+#   host_visual  this file's controller, on the onboard estimate (--source visual)
+# "Flying on the IMU alone" = controller 'host' AND aiding off AND the
+# visual-correction counter not moving. flight_report() checks exactly that.
+CONTROLLERS = ('none', 'visual', 'host', 'host_visual')
+
+
+def host_controller(source):
+    """The `controller` tag for this file's controller flying on `source`."""
+    return 'host_visual' if source == 'visual' else 'host'
 SOURCE_LABEL = {'imu': 'KF (IMU only)', 'visual': 'visual (Flow deck)',
                 'both': 'KF (IMU + visual)'}
 
@@ -348,13 +369,17 @@ class CrazyflieKF:
         self.onboard_p = None           # onboard (Flow deck) estimate
         self.onboard_v = None
         self.aiding = False             # fuse the onboard estimate as measurements
+        self.controller = 'none'        # who commands the motors (CONTROLLERS), set by the flight code
+        self.visual_fixes = 0           # visual measurements actually applied to the KF, ever
+        self.imu_only = False           # lock_imu_only(): no visual measurement can reach the KF
         self._rej_streak = 0
         self.reanchors = 0
         self.thrust = 0.0               # last logged stabilizer.thrust
         self._acc_window = deque(maxlen=self.ZUPT_WINDOW)
         self._n_imu = 0
         self._calib = {"acc": [], "R": [], "t0": None}
-        self.history = None          # set to [] to record (t, p, 1-sigma) per IMU sample
+        self.history = None          # set to [] to record (t, p, 1-sigma, aiding, controller,
+                                     # visual_fixes) per IMU sample
         self.imu_history = None      # set to [] to record raw (t, acc, roll, pitch, yaw)
         self._vib = deque(maxlen=self.VIB_WINDOW)
         self._drag_buf = []
@@ -397,7 +422,9 @@ class CrazyflieKF:
             if self.still and self._n_imu % self.ZUPT_EVERY == 0:
                 self.kf.update_zero_velocity()
             if self.history is not None:
-                self.history.append((t, *self.kf.x[P], *self.kf.uncertainty()))
+                self.history.append((t, *self.kf.x[P], *self.kf.uncertainty(),
+                                     float(self.aiding), CONTROLLERS.index(self.controller),
+                                     self.visual_fixes))
 
     def aux_callback(self, timestamp, data, _logconf):
         with self.lock:
@@ -410,8 +437,9 @@ class CrazyflieKF:
                 self._acc_window.clear()
             self.onboard_p = np.array([data['stateEstimate.x'], data['stateEstimate.y'],
                                        data['stateEstimate.z']])
-            if self.aiding and self.initialized:
+            if self.aiding and self.initialized and not self.imu_only:
                 if self.kf.fix_position(self.onboard_p, self.REF_SIGMA_P):
+                    self.visual_fixes += 1
                     self._rej_streak = 0
                 else:
                     # the KF is more confident than it should be (motors-off
@@ -425,6 +453,7 @@ class CrazyflieKF:
                         if self.onboard_v is not None:
                             self.kf.fix_velocity(self.onboard_v, self.REF_SIGMA_V, force=True)
                         self.reanchors += 1
+                        self.visual_fixes += 1
                         self._rej_streak = 0
             if self.ref_history is not None:
                 self.ref_history.append((timestamp / 1000.0, data['stateEstimate.x'],
@@ -453,8 +482,9 @@ class CrazyflieKF:
         with self.lock:
             self.onboard_v = np.array([data['stateEstimate.vx'], data['stateEstimate.vy'],
                                        data['stateEstimate.vz']])
-            if self.aiding and self.initialized:
-                self.kf.fix_velocity(self.onboard_v, self.REF_SIGMA_V)
+            if self.aiding and self.initialized and not self.imu_only:
+                if self.kf.fix_velocity(self.onboard_v, self.REF_SIGMA_V):
+                    self.visual_fixes += 1
 
     def onboard(self):
         """(onboard p, onboard v), either None until the first packet."""
@@ -462,14 +492,31 @@ class CrazyflieKF:
             return (None if self.onboard_p is None else self.onboard_p.copy(),
                     None if self.onboard_v is None else self.onboard_v.copy())
 
+    def lock_imu_only(self):
+        """Until release_imu_only() no visual measurement reaches the KF: the
+        Flow deck callbacks skip every update and handover() refuses. The
+        onboard estimate is still logged (ref_history) for the report."""
+        with self.lock:
+            self.aiding = False
+            self.imu_only = True
+
+    def release_imu_only(self):
+        """End of the IMU-only segment: visual measurements may reach the KF again."""
+        with self.lock:
+            self.imu_only = False
+
     def handover(self):
         """Stop aiding: from here the KF is on the IMU alone. Returns (KF p,
         onboard p) at that instant, after one last fix of both p and v."""
         with self.lock:
+            if self.imu_only:
+                raise RuntimeError("IMU-only lock is on: no visual fix allowed")
             if self.onboard_p is not None:
                 self.kf.fix_position(self.onboard_p, self.REF_SIGMA_P, force=True)
+                self.visual_fixes += 1
             if self.onboard_v is not None:
                 self.kf.fix_velocity(self.onboard_v, self.REF_SIGMA_V, force=True)
+                self.visual_fixes += 1
             self.aiding = False
             return self.kf.x[P].copy(), (None if self.onboard_p is None
                                          else self.onboard_p.copy())
@@ -670,6 +717,7 @@ def simulate(seed=0, cfg_true: KFConfig | None = None, cfg_filter: KFConfig | No
         ax[0].legend()
         ax[2].set_xlabel('t [s]')
         plt.tight_layout()
+        plt.savefig("kf_sim.png", dpi=200)
         plt.show()
     return res
 
@@ -719,6 +767,7 @@ def fly_onboard(scf, estimator, height=0.5, hover=10.0, settle=2.0, takeoff_time
         events["takeoff"] = time.time()
         print(f"[fly] takeoff to {height} m")
         cf.high_level_commander.takeoff(height, takeoff_time)
+        estimator.controller = 'visual'
         time.sleep(takeoff_time + 0.5)
 
         events["hover"] = time.time()
@@ -735,6 +784,7 @@ def fly_onboard(scf, estimator, height=0.5, hover=10.0, settle=2.0, takeoff_time
         cf.high_level_commander.land(0.0, takeoff_time)
         time.sleep(takeoff_time + 0.5)
         cf.high_level_commander.stop()
+        estimator.controller = 'none'
         events["landed"] = time.time()
         time.sleep(3.0)                     # on the ground: zero velocity stops the drift
     finally:
@@ -864,6 +914,51 @@ class PositionController:
         return math.degrees(roll), math.degrees(pitch), thrust, a
 
 
+class TouchdownDetector:
+    """Touchdown from the IMU: the KF's z drifts, so "z = floor" can't be trusted.
+    Either the velocity step of contact (vertical accel averaged over 0.1 s
+    above touchdown_acc), or the floor carrying it: thrust below floor_thrust x
+    hover while the vertical accel stays ~0, for floor_time (in the air that
+    thrust would sink it at >0.7 m/s^2)."""
+
+    def __init__(self, c: ControlConfig, hover_thrust):
+        self.c, self.hover_thrust = c, hover_thrust
+        self.t_floor = 0.0
+
+    def reset(self):
+        self.t_floor = 0.0
+
+    def __call__(self, az_short, az_mean, thrust, dt):
+        c = self.c
+        if az_short > c.touchdown_acc:
+            return True
+        carried = thrust < c.floor_thrust * self.hover_thrust and abs(az_mean) < c.ground_acc
+        self.t_floor = self.t_floor + dt if carried else 0.0
+        return self.t_floor >= c.floor_time
+
+
+def sink_on_kf(cf, estimator, hover_thrust, c: ControlConfig, source='imu', tag='[fly]'):
+    """Level descent at sink_vz on the estimate's vertical velocity, thrust
+    capped at sink_thrust_max x hover so it always goes down (the estimate can
+    only slow the descent, never stop it), until touchdown or sink_timeout.
+    Returns True on touchdown. The caller stops the motors."""
+    dt = 1.0 / c.rate_hz
+    touched = TouchdownDetector(c, hover_thrust)
+    thrust = hover_thrust
+    t_end = time.time() + c.sink_timeout
+    while time.time() < t_end:
+        _, v, _, az_short, az_mean, _ = estimator.control_state(source)
+        if touched(az_short, az_mean, thrust, dt):
+            print(f"{tag} touchdown")
+            return True
+        thrust = float(np.clip(hover_thrust * (1.0 + c.kd_z * (c.sink_vz - v[2]) / G),
+                               0.75 * hover_thrust, c.sink_thrust_max * hover_thrust))
+        cf.commander.send_setpoint(0, 0, 0, int(thrust))
+        time.sleep(dt)
+    print(f"{tag} no touchdown detected — cutting motors")
+    return False
+
+
 class Abort(Exception):
     pass
 
@@ -893,36 +988,17 @@ def fly(scf, estimator, height=0.5, hover=10.0, hover_thrust=38000, xy=True, fen
     events = {}
     last_cmd = [0.0, 0.0, 0]
     ctl = None
-    floor = {"t": 0.0}
+    detector = None
 
     def touched_down(az_short, az_mean, thrust):
-        """Contact (velocity step), or the floor carrying it for floor_time."""
-        if az_short > c.touchdown_acc:
-            return True
-        carried = thrust < c.floor_thrust * ctl.hover_thrust and abs(az_mean) < c.ground_acc
-        floor["t"] = floor["t"] + dt if carried else 0.0
-        return floor["t"] >= c.floor_time
+        return detector(az_short, az_mean, thrust, dt)
 
     def send(roll, pitch, thrust):
         last_cmd[:] = [roll, pitch, thrust]
         cf.commander.send_setpoint(roll, pitch, 0.0, int(thrust))
 
     def sink():
-        """Level descent at sink_vz on the KF velocity, thrust capped below hover
-        so it always goes down, until touchdown or sink_timeout."""
-        floor["t"] = 0.0
-        t_start = time.time()
-        while time.time() - t_start < c.sink_timeout:
-            _, v, _, az_short, az_mean, _ = estimator.control_state(source)
-            if touched_down(az_short, az_mean, last_cmd[2]):
-                print("[fly] touchdown")
-                return True
-            thrust = ctl.hover_thrust * (1.0 + c.kd_z * (c.sink_vz - v[2]) / G)
-            send(0, 0, float(np.clip(thrust, 0.75 * ctl.hover_thrust,
-                                     c.sink_thrust_max * ctl.hover_thrust)))
-            time.sleep(dt)
-        print("[fly] no touchdown detected — cutting motors")
-        return False
+        return sink_on_kf(cf, estimator, ctl.hover_thrust, c, source)
 
     def check_fence(onboard_p):
         if has_deck and onboard_p is not None and (
@@ -941,6 +1017,7 @@ def fly(scf, estimator, height=0.5, hover=10.0, hover_thrust=38000, xy=True, fen
         cf.supervisor.send_arming_request(True)
         time.sleep(0.5)
         send(0, 0, 0)                                    # unlock the commander
+        estimator.controller = host_controller(source)
         time.sleep(0.1)
 
         try:
@@ -962,6 +1039,7 @@ def fly(scf, estimator, height=0.5, hover=10.0, hover_thrust=38000, xy=True, fen
                 time.sleep(dt)
             hover_est = thrust / (1.0 + az_mean / G)
             ctl = PositionController(hover_est, c, xy=xy)
+            detector = TouchdownDetector(c, hover_est)
             print(f"[fly] liftoff at thrust {thrust:.0f} -> hover thrust {hover_est:.0f}")
             events["liftoff"] = time.time()
 
@@ -1023,6 +1101,7 @@ def fly(scf, estimator, height=0.5, hover=10.0, hover_thrust=38000, xy=True, fen
         send(0, 0, 0)
         cf.commander.send_stop_setpoint()
         cf.commander.send_notify_setpoint_stop()
+        estimator.controller = 'none'
         time.sleep(3.0)                     # on the ground: zero velocity again
     finally:
         cf.commander.send_stop_setpoint()
@@ -1065,9 +1144,15 @@ def fly(scf, estimator, height=0.5, hover=10.0, hover_thrust=38000, xy=True, fen
 #   3. KF       handover: the KF starts from the onboard p, v and stops fusing.
 #               Its position loop sends roll / pitch / thrust and flies a
 #               min-jerk move of `distance` m along +x, then holds `hold` s.
-#   4. visual   notify-stop hands back; the high-level commander (planning
-#               from the onboard state) goes to where the drone really is,
-#               then lands. Aiding resumes.
+#      imu      during step 3 the KF is locked IMU-only (lock_imu_only): the
+#               Flow deck callbacks can't update it, and no decision uses the
+#               onboard estimate — it is only logged, to measure the KF's
+#               error afterwards. A failure can only come from the KF itself
+#               (far from its setpoint) or Ctrl-C.
+#   4. visual   at the end of the move, or on a failure: notify-stop hands
+#               back; the high-level commander (planning from the onboard
+#               state) goes to where the drone really is, then lands. The
+#               IMU-only lock is released and aiding resumes.
 #
 # In step 3 anything wrong hands straight back to visual control: Ctrl-C,
 # the KF more than max_pos_err from its setpoint, or the onboard estimate
@@ -1163,33 +1248,26 @@ def visual_sleep(seconds, guard):
         time.sleep(0.02)
 
 
-def emergency_descent(cf, estimator, hover_thrust, c, cut_below=0.3, vz=-0.3, timeout=12.0):
+def emergency_descent(cf, estimator, hover_thrust, c, cut_below=0.3):
     """The visual estimate is broken: stop fusing it, then cut the motors if
     low, else descend level on the KF's vertical velocity with thrust capped
     below hover (it always goes down), until the IMU feels the floor."""
     estimator.aiding = False
+    estimator.controller = 'host'
     dt = 1.0 / c.rate_hz
     z = estimator.position()[2]
     if hover_thrust is None or z < cut_below:
         print(f"[handover] EMERGENCY: motors cut (KF z {z:.2f} m)")
         cf.commander.send_stop_setpoint()
+        estimator.controller = 'none'
         return
     print(f"[handover] EMERGENCY: level descent on the KF from z {z:.2f} m (Ctrl-C to cut)")
-    floor_t, t_end = 0.0, time.time() + timeout
-    while time.time() < t_end:
-        _, v, _, az_short, az_mean, _ = estimator.control_state()
-        thrust = float(np.clip(hover_thrust * (1.0 + c.kd_z * (vz - v[2]) / G),
-                               0.75 * hover_thrust, c.sink_thrust_max * hover_thrust))
-        if az_short > c.touchdown_acc:
-            break
-        carried = thrust < c.floor_thrust * hover_thrust and abs(az_mean) < c.ground_acc
-        floor_t = floor_t + dt if carried else 0.0
-        if floor_t >= c.floor_time:
-            break
-        cf.commander.send_setpoint(0, 0, 0, int(thrust))
-        time.sleep(dt)
-    print("[handover] down — motors off")
-    cf.commander.send_stop_setpoint()
+    try:
+        sink_on_kf(cf, estimator, hover_thrust, c, tag='[handover]')
+    finally:
+        print("[handover] motors off")
+        cf.commander.send_stop_setpoint()
+        estimator.controller = 'none'
 
 
 def _onboard_vz_avg(estimator, window=0.5):
@@ -1302,6 +1380,7 @@ def fly_handover(scf, estimator, height=0.5, distance=1.0, move_time=4.0, hold=2
         thrusts = []
         try:
             hl.takeoff(height, takeoff_time)
+            estimator.controller = 'visual'
             p_hover = wait_hover(estimator, height, t_min=takeoff_time,
                                  timeout=takeoff_time + 8.0, guard=guard)
             if p_hover is None:
@@ -1325,6 +1404,7 @@ def fly_handover(scf, estimator, height=0.5, distance=1.0, move_time=4.0, hold=2
             hl.land(0.0, max(2.5, height / c.land_rate))
             time.sleep(max(2.5, height / c.land_rate) + 0.5)
             hl.stop()
+            estimator.controller = 'none'
             return result
         hover_thrust = float(np.median(thrusts[len(thrusts) // 2:]))
         p_kf, _, _, _, _, p_on = estimator.control_state()
@@ -1335,9 +1415,13 @@ def fly_handover(scf, estimator, height=0.5, distance=1.0, move_time=4.0, hold=2
 
         # ── 3. the host controller flies, on `source` ───────────────────────
         ctl = PositionController(hover_thrust, c, xy=True)
-        p0_kf, p0_on = estimator.handover()      # KF starts from the onboard p, v
-        if source != 'imu':
+        p0_kf, p0_on = estimator.handover()      # KF starts from the onboard p, v (last visual read)
+        if source == 'imu':
+            estimator.lock_imu_only()            # no visual measurement reaches the KF again
+        else:
             estimator.aiding = True              # visual keeps correcting the KF
+        fixes0 = estimator.visual_fixes          # after the handover snap: must not move for 'imu'
+        estimator.controller = host_controller(source)
         p0_ctl = estimator.control_state(source)[0]
         direction = np.array([1.0, 0.0, 0.0])
         result.update(source=source, p0_ctl=p0_ctl, p0_on=p0_on, t_handover=time.time())
@@ -1358,16 +1442,22 @@ def fly_handover(scf, estimator, height=0.5, distance=1.0, move_time=4.0, hold=2
                 if err > c.max_pos_err:
                     reason = f"{SOURCE_LABEL[source]} {err:.2f} m from its setpoint"
                     break
-                dev = np.linalg.norm(p_on - (p0_on + direction * distance * s))
-                if dev > max_dev:
-                    reason = f"onboard estimate {dev:.2f} m off the planned path"
-                    break
+                if source != 'imu':              # imu: no decision may use the Flow deck
+                    dev = np.linalg.norm(p_on - (p0_on + direction * distance * s))
+                    if dev > max_dev:
+                        reason = f"onboard estimate {dev:.2f} m off the planned path"
+                        break
 
                 roll, pitch, thrust, _ = ctl.compute(p_ref, v_ref, p, v, yaw, dt)
                 cf.commander.send_setpoint(roll, pitch, 0.0, thrust)
+                if int(t / dt) % 25 == 0:
+                    print(f"\r[handover] {SOURCE_LABEL[source]}: {t:4.1f} s, aiding "
+                          f"{'ON' if estimator.aiding else 'off'}, visual corrections since "
+                          f"handover {estimator.visual_fixes - fixes0}   ", end='', flush=True)
                 time.sleep(dt)
         except KeyboardInterrupt:
             reason = "Ctrl-C"
+        result.update(visual_fixes=estimator.visual_fixes - fixes0)
         result.update(p1_ctl=estimator.control_state(source)[0],
                       p1_on=estimator.control_state()[5],
                       sigma1=None if source == 'visual' else estimator.uncertainty(),
@@ -1378,6 +1468,8 @@ def fly_handover(scf, estimator, height=0.5, distance=1.0, move_time=4.0, hold=2
               + (f" — ABORT: {reason}" if reason else "") + " (Ctrl-C to cut motors)")
         try:
             cf.commander.send_notify_setpoint_stop()
+            estimator.controller = 'visual'
+            estimator.release_imu_only()        # the IMU-only segment is over
             p_on = estimator.control_state()[5]
             hl.go_to(p_on[0], p_on[1], height, estimator.control_state()[2], 1.0)
             visual_sleep(2.0, guard)
@@ -1387,6 +1479,7 @@ def fly_handover(scf, estimator, height=0.5, distance=1.0, move_time=4.0, hold=2
             hl.land(0.0, land_time)
             visual_sleep(land_time + 0.5, guard)
             hl.stop()
+            estimator.controller = 'none'
             time.sleep(2.0)
         except VisualFault as exc:
             print(f"\n[handover] VISUAL FAULT: {exc}")
@@ -1409,6 +1502,12 @@ def handover_report(result, distance):
     print(f"\n[handover] {SOURCE_LABEL[source]} segment, "
           f"{result['t_back'] - result['t_handover']:.1f} s"
           + (f" (cut short: {result['reason']})" if result["reason"] else ""))
+    n_vis = result.get("visual_fixes", 0)
+    if source == 'imu':
+        print(f"  visual corrections applied to the KF during it: {n_vis}"
+              + ("  -> IMU only, confirmed" if n_vis == 0 else "  -> NOT IMU only!"))
+    else:
+        print(f"  visual corrections applied during it: {n_vis} (expected for '{source}')")
     print(f"  commanded          {np.round([distance, 0, 0], 3)} m")
     print(f"  controller thought {np.round(d_ctl, 3)} m")
     print(f"  onboard estimate   {np.round(d_on, 3)} m")
@@ -1423,6 +1522,19 @@ def handover_report(result, distance):
               f"(vs commanded; no independent truth for '{source}' without mocap)")
 
 
+def _spans(mask):
+    """(start, end) index pairs of the True runs in a boolean array."""
+    d = np.diff(np.concatenate(([0], mask.astype(int), [0])))
+    return list(zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0] - 1))
+
+
+def imu_only_spans(t, aiding, controller, vfix):
+    """Spans where the host controller flew with aiding off, each with the
+    number of visual corrections applied inside it (0 = IMU only, proven)."""
+    mask = (controller == CONTROLLERS.index('host')) & ~aiding
+    return [(a, b, int(vfix[b] - vfix[a])) for a, b in _spans(mask) if b > a]
+
+
 def flight_report(estimator, out=None, plot=False):
     kf_h = np.array(estimator.history)
     ref = np.array(estimator.ref_history)
@@ -1431,7 +1543,9 @@ def flight_report(estimator, out=None, plot=False):
         return
     t0 = ref[0, 0]
     t_kf, p_kf, s_kf = kf_h[:, 0] - t0, kf_h[:, 1:4], kf_h[:, 4:7]
+    aiding, controller, vfix = kf_h[:, 7] > 0.5, kf_h[:, 8].astype(int), kf_h[:, 9]
     t_ref, p_ref, thrust = ref[:, 0] - t0, ref[:, 1:4], ref[:, 4]
+    imu_only = imu_only_spans(t_kf, aiding, controller, vfix)
     # onboard reference interpolated onto the KF timeline
     p_on = np.stack([np.interp(t_kf, t_ref, p_ref[:, j]) for j in range(3)], axis=1)
     err = p_kf - p_on
@@ -1446,13 +1560,19 @@ def flight_report(estimator, out=None, plot=False):
     print(f"[fly] KF error inside its 3-sigma {inside:.0f}% of the time "
           f"(well below ~99% means the noise model is too optimistic)")
     print("[fly]", estimator.diagnostics())
+    for a, b, n in imu_only:
+        print(f"[fly] flown on the IMU alone: {t_kf[a]:.2f}-{t_kf[b]:.2f} s ({t_kf[b] - t_kf[a]:.1f} s),"
+              f" visual corrections in it: {n}" + ("" if n == 0 else "  <-- NOT IMU only"))
+    if not imu_only:
+        print("[fly] no IMU-only control in this flight")
 
     if out:
         extra = {}
         if estimator.imu_history:
             imu = np.array(estimator.imu_history)
             extra = dict(t_imu=imu[:, 0] - t0, acc=imu[:, 1:4], rpy_deg=imu[:, 4:7])
-        np.savez(out, t_kf=t_kf, p_kf=p_kf, sigma_kf=s_kf,
+        np.savez(out, t_kf=t_kf, p_kf=p_kf, sigma_kf=s_kf, aiding=aiding,
+                 controller=controller, visual_fixes=vfix, controllers=np.array(CONTROLLERS),
                  t_ref=t_ref, p_ref=p_ref, thrust=thrust, **extra)
         print(f"[fly] saved to {out}")
     if plot:
@@ -1460,15 +1580,28 @@ def flight_report(estimator, out=None, plot=False):
         fig, ax = plt.subplots(4, 1, sharex=True, figsize=(9, 8))
         for j, name in enumerate('xyz'):
             ax[j].plot(t_ref, p_ref[:, j], 'k', label='onboard (Flow deck)')
-            ax[j].plot(t_kf, p_kf[:, j], label='KF (IMU only)')
+            ax[j].plot(t_kf, p_kf[:, j], label='KF')
             ax[j].fill_between(t_kf, p_kf[:, j] - 3 * s_kf[:, j], p_kf[:, j] + 3 * s_kf[:, j],
                                alpha=0.2, label='KF 3-sigma')
             ax[j].set_ylabel(f'{name} [m]')
+        for axis in ax:
+            for a, b, _ in imu_only:
+                axis.axvspan(t_kf[a], t_kf[b], color='tab:orange', alpha=0.15, lw=0)
+            vis = np.isin(controller, [CONTROLLERS.index('visual'),
+                                       CONTROLLERS.index('host_visual')])
+            for a, b in _spans(vis):
+                axis.axvspan(t_kf[a], t_kf[b], color='tab:green', alpha=0.08, lw=0)
+        ax[0].plot([], [], color='tab:orange', alpha=0.4, lw=6, label='flown on IMU only')
+        ax[0].plot([], [], color='tab:green', alpha=0.25, lw=6, label='flown on visual')
         ax[0].legend()
         ax[3].plot(t_ref, thrust)
         ax[3].set_ylabel('thrust')
         ax[3].set_xlabel('t [s]')
         plt.tight_layout()
+        if out:
+            png = os.path.splitext(out)[0] + '.png'
+            fig.savefig(png, dpi=150)
+            print(f"[fly] figure saved to {png}")
         plt.show()
 
 
@@ -1492,7 +1625,8 @@ if __name__ == '__main__':
     ap.add_argument('--move-time', type=float, default=4.0, help='s')
     ap.add_argument('--hold', type=float, default=2.0, help='s on the KF after the move')
     ap.add_argument('--max-dev', type=float, default=0.5,
-                    help='m, hand back if the onboard estimate strays this far from the plan')
+                    help='m, hand back if the onboard estimate strays this far from the plan '
+                         '(--source visual/both only: imu never reads the Flow deck after handover)')
     ap.add_argument('--fence', type=float, default=1.0,
                     help='m, abort if the onboard (Flow deck) estimate leaves this radius')
     ap.add_argument('--noise', help='imu_noise.json from imu_allan.py')
@@ -1508,11 +1642,6 @@ if __name__ == '__main__':
     if args.sim:
         simulate(cfg_true=cfg, plot=args.plot)
     elif args.fly or args.fly_onboard or args.handover:
-        import cflib.crtp
-        from cflib.crazyflie import Crazyflie
-        from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
-        from cflib.utils import uri_helper
-
         URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E702')
         logging.basicConfig(level=logging.ERROR)
         cflib.crtp.init_drivers()
